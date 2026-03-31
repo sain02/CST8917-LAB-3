@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>FleetBook — Vehicle Booking Demo</title>
+<style>
+    body { font-family: Arial, sans-serif; margin: 30px; }
+    h1 { color: #0a5; }
+    .card { padding: 12px; border: 1px solid #ccc; border-radius: 8px; margin-top: 12px; }
+    .pending { color: orange; }
+    .confirmed { color: green; font-weight: bold; }
+    .rejected { color: red; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<h1>FleetBook — Vehicle Booking</h1>
+
+<h3>Service Bus Settings</h3>
+
+<label>Namespace Name:</label><br />
+<input type="text" id="sbNamespace" 
+       placeholder="YOUR_NAMESPACE.servicebus.windows.net"><br><br>
+
+<label>SAS Key (RootManageSharedAccessKey — Primary Key):</label><br />
+<input type="password" id="sasKey" placeholder="PASTE PRIMARY KEY HERE"><br><br>
+
+<h3>Submit a Booking</h3>
+
+<label>Customer Name:</label><br />
+<input type="text" id="custName"><br><br>
+
+<label>Customer Email:</label><br />
+<input type="text" id="custEmail"><br><br>
+
+<label>Vehicle Type:</label><br />
+<select id="vehicleType">
+    <option value="sedan">Sedan</option>
+    <option value="suv">SUV</option>
+    <option value="van">Van</option>
+    <option value="truck">Truck</option>
+</select><br><br>
+
+<label>Pickup Location:</label><br />
+<select id="pickupLocation">
+    <option>Ottawa</option>
+    <option>Toronto</option>
+    <option>Montreal</option>
+    <option>Vancouver</option>
+</select><br><br>
+
+<label>Pickup Date:</label><br />
+<input type="date" id="pickupDate"><br><br>
+
+<label>Return Date:</label><br />
+<input type="date" id="returnDate"><br><br>
+
+<button onclick="submitBooking()">Submit Booking Request</button>
+
+<hr>
+
+<h2>Booking Status</h2>
+<div id="results"></div>
+
+<script>
+// =====================================================
+//  Build SAS Token
+// =====================================================
+function buildSasToken(uri, keyName, key) {
+    const expiry = Math.floor(Date.now() / 1000) + 3600;
+    const stringToSign = encodeURIComponent(uri) + "\n" + expiry;
+    const encoder = new TextEncoder();
+
+    return crypto.subtle.importKey(
+        "raw",
+        encoder.encode(key),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+    ).then(cryptoKey => {
+        return crypto.subtle.sign("HMAC", cryptoKey, encoder.encode(stringToSign));
+    }).then(sig => {
+        const signature = btoa(String.fromCharCode(...new Uint8Array(sig)));
+        return `SharedAccessSignature sr=${encodeURIComponent(uri)}&sig=${encodeURIComponent(signature)}&se=${expiry}&skn=${keyName}`;
+    });
+}
+
+// =====================================================
+//  Submit Booking
+// =====================================================
+async function submitBooking() {
+    const namespace = document.getElementById("sbNamespace").value.trim();
+    const sasKey = document.getElementById("sasKey").value.trim();
+
+    if (!namespace || !sasKey) {
+        alert("Please enter Service Bus namespace and SAS key.");
+        return;
+    }
+
+    const booking = {
+        bookingId: "BK-" + Math.floor(Math.random() * 100000),
+        customerName: document.getElementById("custName").value,
+        customerEmail: document.getElementById("custEmail").value,
+        vehicleType: document.getElementById("vehicleType").value,
+        pickupLocation: document.getElementById("pickupLocation").value,
+        pickupDate: document.getElementById("pickupDate").value,
+        returnDate: document.getElementById("returnDate").value,
+        notes: "",
+        submittedAt: new Date().toISOString()
+    };
+
+    const queueUrl = `https://${namespace}.servicebus.windows.net/booking-queue/messages`;
+    const sasToken = await buildSasToken(queueUrl, "RootManageSharedAccessKey", sasKey);
+
+    const resp = await fetch(queueUrl, {
+        method: "POST",
+        headers: {
+            "Authorization": sasToken,
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify(booking)
+    });
+
+    if (resp.status === 201) {
+        addPendingCard(booking.bookingId);
+        startPolling(namespace, sasKey, booking.bookingId);
+    } else {
+        alert("Failed to send booking request");
+    }
+}
+
+// =====================================================
+//  UI: Pending Card
+// =====================================================
+function addPendingCard(id) {
+    document.getElementById("results").innerHTML += `
+        <div class="card" id="card-${id}">
+            <strong>Booking ID: ${id}</strong><br>
+            Status: <span class="pending">Pending...</span>
+        </div>
+    `;
+}
+
+// =====================================================
+//  Polling for Confirmed/Rejected Messages
+// =====================================================
+function startPolling(namespace, sasKey, bookingId) {
+
+    async function checkSub(sub) {
+        const uri = `https://${namespace}.servicebus.windows.net/booking-results/subscriptions/${sub}/messages/head`;
+        const sas = await buildSasToken(uri, "RootManageSharedAccessKey", sasKey);
+
+        const resp = await fetch(uri, {
+            method: "DELETE",
+            headers: { "Authorization": sas }
+        });
+
+        if (resp.status === 200) {
+            const msg = await resp.json();
+            if (msg.bookingId === bookingId) return msg;
+        }
+        return null;
+    }
+
+    const interval = setInterval(async () => {
+        let m = await checkSub("confirmed-sub");
+        if (m) { updateCard(m, true); clearInterval(interval); return; }
+
+        m = await checkSub("rejected-sub");
+        if (m) { updateCard(m, false); clearInterval(interval); return; }
+    }, 4000);
+}
+
+// =====================================================
+//  Update Card UI
+// =====================================================
+function updateCard(data, ok) {
+    const card = document.getElementById("card-" + data.bookingId);
+    card.innerHTML = `
+        <strong>Booking ID: ${data.bookingId}</strong><br>
+        Status: <span class="${ok ? 'confirmed' : 'rejected'}">${data.status}</span><br><br>
+        Reason: ${data.reason}<br><br>
+        ${ok ? `<b>Total Price:</b> $${data.estimatedPrice}` : ""}
+    `;
+}
+</script>
+
+</body>
+</html>
